@@ -1,0 +1,19 @@
+# ROS 2 / colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local/editor files
+.vscode/
+.idea/
+*.swp
+
+# Secrets and local machine configuration
+.env
+*.local.yaml
+*.secret.yaml
