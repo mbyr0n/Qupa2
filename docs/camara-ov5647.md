@@ -88,7 +88,7 @@ La prueba se considera correcta si `dmesg` contiene `OmniVision OV5647 camera dr
 Se probó `libcamera` con `cam -l`, pero no registró ninguna cámara utilizable en esta instalación. La captura sí funcionó mediante V4L2/RKISP, por lo que el backend elegido para QUPA es:
 
 ```text
-/dev/video0 → V4L2 → OpenCV C++
+/dev/video0 → V4L2 → GStreamer → BGR → OpenCV
 ```
 
 No se copiaron `picamera2`, `RPi.GPIO` ni instrucciones específicas de Raspberry Pi.
@@ -118,6 +118,40 @@ scp ubuntu@IP_DE_LA_RADXA:~/test_camera.png .
 La captura mostró correctamente el anillo reflejado del espejo, aunque inicialmente presentaba dominante verde y zonas saturadas. Esto demuestra que el hardware y la captura funcionan; no significa todavía que los colores estén calibrados.
 
 Si `/dev/video0` no existe, no continúes con los comandos de captura: vuelve a la sección anterior y revisa el overlay, `dmesg` y `v4l2-ctl --list-devices`.
+
+### Prueba de GStreamer y OpenCV
+
+Se comprobó que OpenCV 4.6 tiene soporte GStreamer:
+
+```bash
+python3 - <<'PY'
+import cv2
+print(cv2.__version__)
+print("GStreamer: YES" if "GStreamer:                   YES" in cv2.getBuildInformation() else "GStreamer: NO")
+PY
+```
+
+La tubería usada por el futuro nodo C++ es:
+
+```text
+v4l2src /dev/video0
+  → UYVY 640×480
+  → videoconvert
+  → BGR
+  → appsink
+  → cv::VideoCapture(CAP_GSTREAMER)
+```
+
+La prueba mínima desde la Radxa fue:
+
+```bash
+gst-launch-1.0 -v \
+  v4l2src device=/dev/video0 num-buffers=100 ! \
+  video/x-raw,format=UYVY,width=640,height=480 ! \
+  videoconvert ! fakesink sync=false
+```
+
+También se verificó desde Python que `VideoCapture` se abre y entrega un frame con forma `(480, 640, 3)`. El FPS que GStreamer anuncia puede ser nominal y no debe tomarse como medición definitiva; para rendimiento se utiliza la prueba real de streaming de la sección 4.
 
 ## 3. Ajustar exposición, ganancia y balance
 
@@ -223,12 +257,115 @@ final_mirror_roi.png
 
 La ROI final conserva el anillo útil, elimina el centro y descarta los soportes para reducir reflejos y falsos positivos. Estos valores son propios de ese montaje: si se mueve el espejo o la cámara, se repite esta calibración antes de calibrar colores.
 
-## 7. Siguiente etapa: colores y blobs
+## 7. Separar los archivos de calibración
 
-La calibración de colores se hará en la PC con Python, usando marcadores azules y verdes a diferentes ángulos y distancias. Los rangos HSV y la geometría se guardarán en YAML y luego se copiarán a la Radxa. La ejecución continua quedará en C++/OpenCV:
+La calibración se realiza en la PC, pero sus resultados los consume el programa que corre en la Radxa. Se decidió mantener separados los parámetros geométricos y los parámetros de color para que cada etapa pueda modificarse y verificarse sin afectar a la otra.
+
+La estructura final es:
 
 ```text
-V4L2 → cv::Mat → ROI del espejo → HSV → morfología → contornos → blobs → ROS 2
+qupa_geometry.yaml   ← cámara, espejo y soportes
+qupa_colors.yaml     ← rangos HSV de cada color
 ```
 
-Python se mantiene como herramienta de calibración; `qupa_camera` y `qupa_vision` serán componentes de producción en C++.
+### `qupa_geometry.yaml`
+
+Este archivo contiene solamente la geometría y la configuración física de la imagen:
+
+```yaml
+camera:
+  width: 640
+  height: 480
+
+mirror:
+  center_x: 307.01
+  center_y: 238.47
+  inner_radius: 59.52
+  outer_radius: 133.35
+  support_masks:
+    left: []
+    right: []
+```
+
+### `qupa_colors.yaml`
+
+Este archivo se calibra por separado cuando haya iluminación representativa y contiene únicamente los rangos HSV:
+
+```yaml
+colors:
+  blue:
+    h_min: 0
+    h_max: 0
+    s_min: 0
+    s_max: 0
+    v_min: 0
+    v_max: 0
+
+  green:
+    h_min: 0
+    h_max: 0
+    s_min: 0
+    s_max: 0
+    v_min: 0
+    v_max: 0
+```
+
+Los ceros son marcadores de estructura, no valores finales. Deben reemplazarse con los resultados de la calibración HSV.
+
+Durante la etapa geométrica se utilizó `calibrate_qupa.py`. El flujo es:
+
+```text
+1. marcar borde exterior
+2. pulsar N
+3. marcar borde interior
+4. pulsar N
+5. marcar soporte izquierdo
+6. pulsar N
+7. marcar soporte derecho
+8. pulsar S para guardar
+```
+
+El programa genera los archivos geométricos y las imágenes de verificación:
+
+```text
+qupa_geometry.yaml
+qupa_mask.png
+qupa_roi.png
+```
+
+La imagen `qupa_roi.png` debe revisarse antes de continuar: solo debe quedar el anillo útil del espejo.
+
+Cuando se calibre el color, `qupa_colors.yaml` se copiará por separado. Por ejemplo, desde la PC:
+
+```powershell
+scp qupa_geometry.yaml ubuntu@IP_DE_LA_RADXA:~/qupa_ws/src/qupa_vision/config/
+scp qupa_colors.yaml ubuntu@IP_DE_LA_RADXA:~/qupa_ws/src/qupa_vision/config/
+```
+
+El nodo de visión cargará ambos archivos desde `qupa_vision/config/`. La geometría puede permanecer estable aunque se vuelvan a calibrar los colores.
+
+## 8. Siguiente etapa: colores, dirección y distancia
+
+La calibración de colores se hará en la PC con Python y guardará sus resultados en `qupa_colors.yaml`, usando marcadores azules y verdes a diferentes ángulos y distancias. No se debe calibrar HSV con poca iluminación o en condiciones que no representen el entorno real del robot. Para obtener resultados repetibles conviene comparar el balance de blancos automático con un balance fijo y considerar iluminación blanca difusa propia del robot, evitando reflejos directos en el espejo.
+
+Después de los colores faltan dos calibraciones geométricas:
+
+- `angle_offset`: relaciona el ángulo de la imagen con el frente físico del QUPA.
+- distancia: relaciona el radio del blob en el espejo con metros reales; esta relación no es lineal y se obtiene midiendo distancias conocidas.
+
+La ejecución continua quedará en C++/OpenCV:
+
+```text
+V4L2 → GStreamer → cv::Mat BGR → ROI del espejo → HSV → morfología → contornos → blobs → ROS 2
+```
+
+Python se mantiene como herramienta de calibración; `qupa_camera` y `qupa_vision` serán componentes de producción en C++. El flujo final será:
+
+```text
+OV5647 → GStreamer → cv::Mat BGR
+       → qupa_geometry.yaml + qupa_colors.yaml
+       → ROI del espejo
+       → HSV y blobs
+       → angle_offset + distancia
+       → /camera/detections en ROS 2
+```
