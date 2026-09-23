@@ -84,6 +84,7 @@ El código que corre continuamente en el robot será C/C++. Python se reservará
 ## Documentación
 
 - [Instalación y configuración base](docs/configuracion-base.md)
+- [Configuración de la cámara OV5647](docs/camara-ov5647.md)
 - [Arquitectura de software](docs/arquitectura.md)
 - [Registro de decisiones y pendientes](docs/decisiones.md)
 
